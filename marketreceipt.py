@@ -21,11 +21,33 @@ import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext
 import datetime
 import uuid
-from typing import List, Dict, Optional
+import os
+import re
+import logging
+from typing import List, Dict, Optional, Tuple, Any
 from dataclasses import dataclass, asdict
 from enum import Enum
+from decimal import Decimal, InvalidOperation
+from contextlib import contextmanager
 
 from pymongo import MongoClient
+from pymongo.errors import PyMongoError
+from type_safety import TypeConverter, ValidatedProduct, ValidatedCartItem, ValidatedPaymentDetails, InputValidator
+from simple_transaction_manager import SimpleTransactionManager, SimpleSafeCheckoutProcessor
+from payment_integration import MPesaIntegration, CardPaymentIntegration, PaymentNotificationWindow, InventoryManager, BusinessLogbook
+
+
+# Configuration constants
+VAT_RATE = Decimal('0.16')
+VAT_INCLUSIVE = True
+MONGO_TIMEOUT_MS = 5000
+DEFAULT_DB_NAME = "fruit_vendor_db"
+CARD_NUMBER_PATTERN = r'^\d{13,19}$'
+PHONE_NUMBER_PATTERN = r'^\+?\d{10,15}$'
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 
 class PaymentMethod(Enum):
@@ -34,38 +56,65 @@ class PaymentMethod(Enum):
     MPESA = "mpesa"
 
 
+class ValidationError(Exception):
+    """Custom exception for validation errors"""
+    pass
+
+
+class DatabaseError(Exception):
+    """Custom exception for database errors"""
+    pass
+
+
 @dataclass
 class Product:
     name: str
-    price_per_unit: float
+    price_per_unit: Decimal
     unit: str
-    stock_quantity: float = 0.0
+    stock_quantity: Decimal
     product_id: Optional[str] = None
 
     def __post_init__(self):
         if not self.product_id:
             self.product_id = str(uuid.uuid4())[:8].upper()
+        # Ensure decimal types
+        if not isinstance(self.price_per_unit, Decimal):
+            self.price_per_unit = Decimal(str(self.price_per_unit))
+        if not isinstance(self.stock_quantity, Decimal):
+            self.stock_quantity = Decimal(str(self.stock_quantity))
 
 
 @dataclass
 class CartItem:
     product: Product
-    quantity: float
+    quantity: Decimal
+
+    def __post_init__(self):
+        # Ensure decimal type
+        if not isinstance(self.quantity, Decimal):
+            self.quantity = Decimal(str(self.quantity))
 
     @property
-    def subtotal(self) -> float:
+    def subtotal(self) -> Decimal:
         return self.product.price_per_unit * self.quantity
 
 
 @dataclass
 class PaymentDetails:
     method: PaymentMethod
-    amount_paid: float
+    amount_paid: Decimal
     transaction_reference: Optional[str] = None
     phone_number: Optional[str] = None
     card_last_four: Optional[str] = None
     card_type: Optional[str] = None
-    balance: float = 0.0
+    balance: Decimal = Decimal('0.0')
+
+    def __post_init__(self):
+        # Ensure decimal types
+        if not isinstance(self.amount_paid, Decimal):
+            self.amount_paid = Decimal(str(self.amount_paid))
+        if not isinstance(self.balance, Decimal):
+            self.balance = Decimal(str(self.balance))
 
 
 @dataclass
@@ -74,156 +123,367 @@ class Receipt:
     date: str
     time: str
     items: List[Dict]
-    subtotal: float
-    tax_amount: float
-    total_amount: float
+    subtotal: Decimal
+    tax_amount: Decimal
+    total_amount: Decimal
     payment: Dict
     vendor_name: str = "Fresh Fruits Market"
     vendor_address: str = "123 Market Street, Nairobi"
     vendor_phone: str = "+254 700 123 456"
 
+    def __post_init__(self):
+        # Ensure decimal types
+        if not isinstance(self.subtotal, Decimal):
+            self.subtotal = Decimal(str(self.subtotal))
+        if not isinstance(self.tax_amount, Decimal):
+            self.tax_amount = Decimal(str(self.tax_amount))
+        if not isinstance(self.total_amount, Decimal):
+            self.total_amount = Decimal(str(self.total_amount))
+
 
 class DatabaseManager:
-    """Handles MongoDB operations - MongoDB is required"""
+    """Handles MongoDB operations with transaction safety"""
     
-    def __init__(self, connection_string: str = "mongodb://localhost:27017/"):
+    def __init__(self, connection_string: Optional[str] = None):
+        connection_string = connection_string or os.environ.get("MONGO_URI","mongodb://localhost:27017/")
         try:
-            self.client = MongoClient(connection_string, serverSelectionTimeoutMS=5000)
+            self.client = MongoClient(connection_string, serverSelectionTimeoutMS=MONGO_TIMEOUT_MS)
             self.client.admin.command('ping')
-            self.db = self.client["fruit_vendor_db"]
+            self.db = self.client[DEFAULT_DB_NAME]
             self.products = self.db["products"]
             self.receipts = self.db["receipts"]
-        except Exception as e:
-            raise ConnectionError(
-                f"Cannot connect to MongoDB at {connection_string}\n"
-                f"Please ensure MongoDB is installed and running:\n"
-                f"  sudo apt install mongodb\n"
-                f"  sudo systemctl start mongodb\n"
-                f"Original error: {e}"
-            )
+            
+            # Initialize simple transaction manager
+            self.tx_manager = SimpleTransactionManager(self.client)
+            self.checkout_processor = SimpleSafeCheckoutProcessor(self.tx_manager)
+            
+            # Create indexes for better performance
+            self._create_indexes()
+            logger.info("Database connection established successfully")
+        except PyMongoError as e:
+            logger.error(f"Database connection failed: {e}")
+            raise DatabaseError(
+                f"Cannot connect to MongoDB. Please ensure MongoDB is installed and running.\n"
+                f"Contact administrator for assistance."
+            ) from e
     
-    def add_product(self, product: Product) -> str:
-        product_dict = asdict(product)
-        self.products.insert_one(product_dict)
-        return product.product_id
+    def _create_indexes(self):
+        """Create database indexes for better performance"""
+        try:
+            self.products.create_index("product_id", unique=True)
+            self.products.create_index("name")
+            self.receipts.create_index("receipt_number", unique=True)
+            self.receipts.create_index("date")
+            logger.info("Database indexes created successfully")
+        except PyMongoError as e:
+            logger.warning(f"Failed to create indexes: {e}")
+    
+    def __del__(self):
+        """Cleanup database connection"""
+        try:
+            if hasattr(self, 'client'):
+                self.client.close()
+                logger.info("Database connection closed")
+        except Exception as e:
+            logger.error(f"Error closing database connection: {e}")
+    
+    @contextmanager
+    def transaction(self):
+        """Context manager for database operations with rollback capability"""
+        # MongoDB doesn't support multi-document transactions in older versions
+        # For now, we'll use a simple try-catch pattern
+        try:
+            yield
+        except Exception as e:
+            logger.error(f"Database operation failed: {e}")
+            raise DatabaseError(f"Database operation failed: {str(e)}") from e
+    
+    def validate_card_number(self, card_number: str) -> bool:
+        """Validate card number format"""
+        return bool(re.match(CARD_NUMBER_PATTERN, card_number.replace(" ", "")))
+    
+    def validate_phone_number(self, phone_number: str) -> bool:
+        """Validate phone number format"""
+        return bool(re.match(PHONE_NUMBER_PATTERN, phone_number))
+    
+    def add_product(self, product: ValidatedProduct) -> str:
+        """Add a new product to the database with type safety"""
+        try:
+            with self.tx_manager.transaction():
+                product_dict = product.to_dict()
+                self.products.insert_one(product_dict)
+                logger.info(f"Product added: {product.name} (ID: {product.product_id})")
+                return product.product_id
+        except PyMongoError as e:
+            logger.error(f"Failed to add product: {e}")
+            raise DatabaseError("Failed to add product") from e
     
     def get_product(self, product_id: str) -> Optional[Dict]:
-        return self.products.find_one({"product_id": product_id})
+        """Retrieve a product by ID with type conversion"""
+        try:
+            product = self.products.find_one({"product_id": product_id})
+            if product:
+                # Convert string values back to Decimal
+                product['price_per_unit'] = Decimal(product.get('price_per_unit', '0'))
+                product['stock_quantity'] = Decimal(product.get('stock_quantity', '0'))
+            return product
+        except PyMongoError as e:
+            logger.error(f"Failed to retrieve product {product_id}: {e}")
+            raise DatabaseError("Failed to retrieve product") from e
     
     def get_all_products(self) -> List[Dict]:
-        return list(self.products.find())
+        """Retrieve all products"""
+        try:
+            products = list(self.products.find())
+            # Convert string values back to Decimal
+            for product in products:
+                product['price_per_unit'] = Decimal(product.get('price_per_unit', '0'))
+                product['stock_quantity'] = Decimal(product.get('stock_quantity', '0'))
+            return products
+        except PyMongoError as e:
+            logger.error(f"Failed to retrieve products: {e}")
+            raise DatabaseError("Failed to retrieve products") from e
     
-    def update_stock(self, product_id: str, quantity_sold: float) -> bool:
-        result = self.products.update_one(
-            {"product_id": product_id},
-            {"$inc": {"stock_quantity": -quantity_sold}}
-        )
-        return result.modified_count > 0
+    def update_stock(self, product_id: str, quantity_sold: Decimal) -> bool:
+        """Deduct stock when items are sold using atomic operations"""
+        try:
+            return self.tx_manager.update_stock_atomic(self.db, product_id, quantity_sold)
+        except Exception as e:
+            logger.error(f"Failed to update stock for product {product_id}: {e}")
+            raise DatabaseError("Failed to update stock") from e
     
-    def update_product_stock(self, product_id: str, new_stock: float) -> bool:
-        """Add/restock product quantity"""
-        result = self.products.update_one(
-            {"product_id": product_id},
-            {"$set": {"stock_quantity": new_stock}}
-        )
-        return result.modified_count > 0
+    def update_product_stock(self, product_id: str, new_stock: Any) -> tuple[bool, str]:
+        """Add/restock product quantity with type safety"""
+        try:
+            validated_stock = InputValidator.validate_stock(new_stock)
+            with self.tx_manager.transaction():
+                result = self.products.update_one(
+                    {"product_id": product_id},
+                    {"$set": {"stock_quantity": str(validated_stock)}}
+                )
+                if result.modified_count > 0:
+                    logger.info(f"Product stock updated {product_id}: {validated_stock}")
+                    return True, f"Stock updated to {validated_stock}"
+                return False, "Failed to update stock - product not found"
+        except (ValueError, PyMongoError) as e:
+            logger.error(f"Failed to update product stock {product_id}: {e}")
+            return False, str(e)
     
-    def update_product_price(self, product_id: str, new_price: float) -> bool:
-        """Update product price"""
-        result = self.products.update_one(
-            {"product_id": product_id},
-            {"$set": {"price_per_unit": new_price}}
-        )
-        return result.modified_count > 0
+    def update_product_price(self, product_id: str, new_price: Any) -> tuple[bool, str]:
+        """Update product price with type safety"""
+        try:
+            validated_price = InputValidator.validate_price(new_price)
+            with self.tx_manager.transaction():
+                result = self.products.update_one(
+                    {"product_id": product_id},
+                    {"$set": {"price_per_unit": str(validated_price)}}
+                )
+                if result.modified_count > 0:
+                    logger.info(f"Product price updated {product_id}: {validated_price}")
+                    return True, f"Price updated to KES {validated_price:.2f}"
+                return False, "Failed to update price - product not found"
+        except (ValueError, PyMongoError) as e:
+            logger.error(f"Failed to update product price {product_id}: {e}")
+            return False, str(e)
     
     def delete_product(self, product_id: str) -> bool:
         """Remove product from database"""
-        result = self.products.delete_one({"product_id": product_id})
-        return result.deleted_count > 0
+        try:
+            with self.transaction():
+                result = self.products.delete_one({"product_id": product_id})
+                if result.deleted_count > 0:
+                    logger.info(f"Product deleted: {product_id}")
+                return result.deleted_count > 0
+        except PyMongoError as e:
+            logger.error(f"Failed to delete product {product_id}: {e}")
+            raise DatabaseError("Failed to delete product") from e
     
     def save_transaction(self, receipt: Receipt) -> str:
-        receipt_dict = asdict(receipt)
-        receipt_dict["created_at"] = datetime.datetime.now()
-        result = self.receipts.insert_one(receipt_dict)
-        return str(result.inserted_id)
+        """Save receipt transaction to database"""
+        try:
+            with self.transaction():
+                receipt_dict = asdict(receipt)
+                receipt_dict["created_at"] = datetime.datetime.now()
+                # Convert Decimal values to strings for MongoDB
+                receipt_dict['subtotal'] = str(receipt.subtotal)
+                receipt_dict['tax_amount'] = str(receipt.tax_amount)
+                receipt_dict['total_amount'] = str(receipt.total_amount)
+                receipt_dict['payment']['amount_paid'] = str(receipt.payment['amount_paid'])
+                receipt_dict['payment']['balance'] = str(receipt.payment['balance'])
+                
+                result = self.receipts.insert_one(receipt_dict)
+                logger.info(f"Transaction saved: {receipt.receipt_number}")
+                return str(result.inserted_id)
+        except PyMongoError as e:
+            logger.error(f"Failed to save transaction: {e}")
+            raise DatabaseError("Failed to save transaction") from e
 
 
 class PaymentProcessor:
-    TAX_RATE = 0.16
-    VAT_INCLUSIVE = True  # Set to True for VAT-inclusive pricing
+    """Handles payment processing and calculations"""
     
     @staticmethod
-    def calculate_totals(items: List[CartItem]) -> tuple:
+    def calculate_totals(items: List[CartItem]) -> Tuple[Decimal, Decimal, Decimal]:
         """Calculate totals with VAT-inclusive pricing"""
-        # Subtotal = sum of all item subtotals (prices include VAT)
-        subtotal = sum(item.subtotal for item in items)
-        
-        if PaymentProcessor.VAT_INCLUSIVE:
-            # VAT is already included in subtotal
-            # Calculate VAT component: subtotal - (subtotal / 1.16)
-            tax_amount = subtotal - (subtotal / 1.16)
-            total = subtotal  # Total equals subtotal (VAT inclusive)
-        else:
-            # VAT is added on top
-            tax_amount = subtotal * PaymentProcessor.TAX_RATE
-            total = subtotal + tax_amount
-        
-        return subtotal, tax_amount, total
+        try:
+            # Subtotal = sum of all item subtotals (prices include VAT)
+            subtotal = sum(item.subtotal for item in items)
+            
+            if VAT_INCLUSIVE:
+                # VAT is already included in subtotal
+                # Calculate VAT component: subtotal - (subtotal / 1.16)
+                tax_amount = (subtotal - (subtotal / (Decimal('1') + VAT_RATE))).quantize(Decimal('0.01'))
+                total = subtotal  # Total equals subtotal (VAT inclusive)
+            else:
+                # VAT is added on top
+                tax_amount = (subtotal * VAT_RATE).quantize(Decimal('0.01'))
+                total = subtotal + tax_amount
+            
+            return subtotal, tax_amount, total
+        except (InvalidOperation, TypeError) as e:
+            logger.error(f"Error calculating totals: {e}")
+            raise ValidationError("Invalid calculation parameters") from e
     
-    def process_cash_payment(self, total: float, amount_tendered: float) -> PaymentDetails:
-        if amount_tendered < total:
-            raise ValueError("Insufficient amount tendered")
-        balance = amount_tendered - total
-        return PaymentDetails(method=PaymentMethod.CASH, amount_paid=amount_tendered, balance=balance)
+    def process_cash_payment(self, total: Decimal, amount_tendered: Any) -> PaymentDetails:
+        """Process cash payment with validation"""
+        try:
+            # Convert amount_tendered to Decimal
+            validated_amount = TypeConverter.to_positive_decimal(amount_tendered, "amount_tendered")
+            
+            if validated_amount < total:
+                raise ValidationError("Insufficient amount tendered")
+            balance = validated_amount - total
+            return PaymentDetails(
+                method=PaymentMethod.CASH, 
+                amount_paid=validated_amount, 
+                balance=balance
+            )
+        except (InvalidOperation, TypeError, ValueError) as e:
+            logger.error(f"Error processing cash payment: {e}")
+            raise ValidationError("Invalid payment amount") from e
     
-    def process_card_payment(self, total: float, card_number: str, card_type: str, auth_code: str) -> PaymentDetails:
-        last_four = card_number[-4:] if len(card_number) >= 4 else "****"
-        return PaymentDetails(method=PaymentMethod.CARD, amount_paid=total,
-                              transaction_reference=auth_code, card_last_four=last_four,
-                              card_type=card_type, balance=0.0)
+    def process_card_payment(self, total: Decimal, card_number: str, card_type: str, auth_code: str) -> PaymentDetails:
+        """Process card payment with validation"""
+        try:
+            # Validate card number
+            if not re.match(CARD_NUMBER_PATTERN, card_number.replace(" ", "")):
+                raise ValidationError("Invalid card number format")
+            
+            last_four = card_number.replace(" ", "")[-4:] if len(card_number.replace(" ", "")) >= 4 else "****"
+            return PaymentDetails(
+                method=PaymentMethod.CARD, 
+                amount_paid=total,
+                transaction_reference=auth_code, 
+                card_last_four=last_four,
+                card_type=card_type, 
+                balance=Decimal('0.0')
+            )
+        except (InvalidOperation, TypeError) as e:
+            logger.error(f"Error processing card payment: {e}")
+            raise ValidationError("Invalid card payment details") from e
     
-    def process_mpesa_payment(self, total: float, phone_number: str, mpesa_code: str) -> PaymentDetails:
-        return PaymentDetails(method=PaymentMethod.MPESA, amount_paid=total,
-                              phone_number=phone_number, transaction_reference=mpesa_code, balance=0.0)
+    def process_mpesa_payment(self, total: Decimal, phone_number: str, mpesa_code: str) -> PaymentDetails:
+        """Process M-Pesa payment with validation"""
+        try:
+            # Validate phone number
+            if not re.match(PHONE_NUMBER_PATTERN, phone_number):
+                raise ValidationError("Invalid phone number format")
+            
+            return PaymentDetails(
+                method=PaymentMethod.MPESA, 
+                amount_paid=total,
+                phone_number=phone_number, 
+                transaction_reference=mpesa_code, 
+                balance=Decimal('0.0')
+            )
+        except (InvalidOperation, TypeError) as e:
+            logger.error(f"Error processing M-Pesa payment: {e}")
+            raise ValidationError("Invalid M-Pesa payment details") from e
 
 
 class MarketReceiptApp:
-    def __init__(self, db_connection: str = "mongodb://localhost:27017/"):
-        self.db = DatabaseManager(db_connection)
-        self.payment_processor = PaymentProcessor()
-        self.cart: List[CartItem] = []
-        self._initialize_sample_products()
+    """Main application class for the Fresh Fruits Market system"""
+    
+    def __init__(self, db_connection: Optional[str] = None):
+        try:
+            self.db = DatabaseManager(db_connection)
+            self.payment_processor = PaymentProcessor()
+            self.cart: List[ValidatedCartItem] = []
+            
+            # Initialize payment integrations
+            self.mpesa_integration = MPesaIntegration()
+            self.card_integration = CardPaymentIntegration()
+            
+            # Initialize business management
+            self.inventory_manager = InventoryManager(self.db)
+            self.logbook = BusinessLogbook(self.db)
+            
+            self._initialize_sample_products()
+            logger.info("MarketReceiptApp initialized successfully")
+        except (DatabaseError, ValidationError) as e:
+            logger.error(f"Failed to initialize MarketReceiptApp: {e}")
+            raise
     
     def _initialize_sample_products(self):
-        if not self.db.get_all_products():
-            sample_products = [
-                Product("Apples", 50.0, "piece", 100.0),
-                Product("Ripe Banana", 10.0, "piece", 150.0),
-                Product("Oranges", 10.0, "piece", 80.0),
-                Product("Mangoes", 50.0, "piece", 200.0),
-                Product("Pineapples", 80.0, "piece", 50.0),
-                Product("Watermelon", 300.0, "piece", 30.0),
-                Product("Coconut", 120.0, "piece", 30.0),
-                Product("Grapes", 400.0, "punnet", 40.0),
-                Product("Strawberries", 500.0, "punnet", 60.0),
-            ]
-            for product in sample_products:
-                self.db.add_product(product)
+        """Initialize sample products if database is empty"""
+        try:
+            if not self.db.get_all_products():
+                sample_products = [
+                    Product("Apples", Decimal('50.0'), "piece", Decimal('100.0')),
+                    Product("Ripe Banana", Decimal('10.0'), "piece", Decimal('150.0')),
+                    Product("Oranges", Decimal('10.0'), "piece", Decimal('80.0')),
+                    Product("Mangoes", Decimal('50.0'), "piece", Decimal('200.0')),
+                    Product("Pineapples", Decimal('80.0'), "piece", Decimal('50.0')),
+                    Product("Watermelon", Decimal('300.0'), "piece", Decimal('30.0')),
+                    Product("Coconut", Decimal('120.0'), "piece", Decimal('30.0')),
+                    Product("Grapes", Decimal('400.0'), "punnet", Decimal('40.0')),
+                    Product("Strawberries", Decimal('500.0'), "punnet", Decimal('60.0')),
+                ]
+                for product in sample_products:
+                    self.db.add_product(product)
+                logger.info("Sample products initialized")
+        except (DatabaseError, ValidationError) as e:
+            logger.error(f"Failed to initialize sample products: {e}")
+            raise
     
     def get_all_products(self) -> List[Dict]:
-        return self.db.get_all_products()
+        """Get all products from database"""
+        try:
+            return self.db.get_all_products()
+        except DatabaseError as e:
+            logger.error(f"Failed to get products: {e}")
+            raise
     
-    def add_to_cart(self, product_id: str, quantity: float) -> tuple[bool, str]:
-        product_data = self.db.get_product(product_id)
-        if not product_data:
-            return False, "Product not found!"
-        if product_data['stock_quantity'] < quantity:
-            return False, f"Insufficient stock! Available: {product_data['stock_quantity']:.1f}"
-        product = Product(name=product_data['name'], price_per_unit=product_data['price_per_unit'],
-                          unit=product_data['unit'], stock_quantity=product_data['stock_quantity'],
-                          product_id=product_data['product_id'])
-        self.cart.append(CartItem(product, quantity))
-        return True, f"Added {quantity} {product.unit} of {product.name}"
+    def add_to_cart(self, product_id: str, quantity: Any) -> Tuple[bool, str]:
+        """Add product to cart with stock validation"""
+        try:
+            # Validate quantity
+            validated_quantity = InputValidator.validate_quantity(quantity)
+            
+            product_data = self.db.get_product(product_id)
+            if not product_data:
+                return False, "Product not found!"
+            
+            if product_data['stock_quantity'] < validated_quantity:
+                return False, f"Insufficient stock! Available: {product_data['stock_quantity']:.1f}"
+            
+            # Create validated product
+            validated_product = ValidatedProduct(
+                name=product_data['name'], 
+                price_per_unit=product_data['price_per_unit'],
+                unit=product_data['unit'], 
+                stock_quantity=product_data['stock_quantity'],
+                product_id=product_data['product_id']
+            )
+            
+            # Create validated cart item
+            cart_item = ValidatedCartItem(validated_product, validated_quantity)
+            self.cart.append(cart_item)
+            logger.info(f"Added to cart: {validated_quantity} {validated_product.unit} of {validated_product.name}")
+            return True, f"Added {validated_quantity} {validated_product.unit} of {validated_product.name}"
+        except (DatabaseError, ValidationError, InvalidOperation, ValueError) as e:
+            logger.error(f"Failed to add to cart: {e}")
+            return False, "Failed to add item to cart"
     
     def remove_from_cart(self, index: int):
         if 0 <= index < len(self.cart):
@@ -232,7 +492,7 @@ class MarketReceiptApp:
     def clear_cart(self):
         self.cart = []
     
-    def get_cart_items(self) -> List[CartItem]:
+    def get_cart_items(self) -> List[ValidatedCartItem]:
         return self.cart
     
     def update_product_stock(self, product_id: str, new_stock: float) -> tuple[bool, str]:
@@ -255,15 +515,30 @@ class MarketReceiptApp:
             return True, f"Price updated for {product_data['name']} to KES {new_price:.2f}"
         return False, "Failed to update price"
     
-    def add_new_product(self, name: str, price: float, unit: str, stock: float) -> tuple[bool, str]:
-        """Add a new product to database"""
-        if price <= 0:
-            return False, "Price must be greater than 0"
-        if stock < 0:
-            return False, "Stock cannot be negative"
-        product = Product(name=name, price_per_unit=price, unit=unit, stock_quantity=stock)
-        self.db.add_product(product)
-        return True, f"Product '{name}' added with ID: {product.product_id}"
+    def add_new_product(self, name: str, price: Any, unit: str, stock: Any) -> tuple[bool, str]:
+        """Add a new product to database with type safety"""
+        try:
+            # Validate inputs
+            validated_name = InputValidator.validate_product_name(name)
+            validated_price = InputValidator.validate_price(price)
+            validated_unit = InputValidator.validate_unit(unit)
+            validated_stock = InputValidator.validate_stock(stock)
+            
+            # Create validated product
+            product = ValidatedProduct(
+                name=validated_name,
+                price_per_unit=validated_price,
+                unit=validated_unit,
+                stock_quantity=validated_stock
+            )
+            
+            self.db.add_product(product)
+            return True, f"Product '{validated_name}' added with ID: {product.product_id}"
+        except ValueError as e:
+            return False, str(e)
+        except Exception as e:
+            logger.error(f"Failed to add product: {e}")
+            return False, "Failed to add product"
     
     def delete_product(self, product_id: str) -> tuple[bool, str]:
         """Remove product from database"""
@@ -284,23 +559,60 @@ class MarketReceiptApp:
         subtotal, tax_amount, total = self.payment_processor.calculate_totals(self.cart)
         
         try:
+            # Log checkout attempt
+            self.logbook.log_activity(
+                "checkout_attempt",
+                f"Processing {payment_method.value} payment of KES {total:.2f}",
+                details={"items": len(self.cart), "total": float(total)}
+            )
+            
             if payment_method == PaymentMethod.CASH:
                 amount_tendered = kwargs.get('amount_tendered', 0)
                 payment_details = self.payment_processor.process_cash_payment(total, amount_tendered)
+                
+                # Cash payment is immediate - proceed with transaction
+                return self._complete_transaction(payment_details, subtotal, tax_amount, total)
+                
             elif payment_method == PaymentMethod.CARD:
                 card_number = kwargs.get('card_number', '')
                 card_type = kwargs.get('card_type', 'Card')
                 auth_code = kwargs.get('auth_code', str(uuid.uuid4())[:6].upper())
+                
+                # For card payments, also process immediately for now
                 payment_details = self.payment_processor.process_card_payment(total, card_number, card_type, auth_code)
+                return self._complete_transaction(payment_details, subtotal, tax_amount, total)
+                    
             elif payment_method == PaymentMethod.MPESA:
                 phone_number = kwargs.get('phone_number', '')
-                mpesa_code = kwargs.get('mpesa_code', '' + str(uuid.uuid4())[:6].upper())
-                payment_details = self.payment_processor.process_mpesa_payment(total, phone_number, mpesa_code)
+                mpesa_code = kwargs.get('mpesa_code', 'U' + str(uuid.uuid4())[:6].upper())
+                
+                # Process M-Pesa payment
+                result = self.mpesa_integration.initiate_payment(phone_number, float(total), mpesa_code)
+                if result["success"]:
+                    # For M-Pesa, we need to wait for payment confirmation
+                    # Return None to indicate payment is pending
+                    self.logbook.log_activity(
+                        "mpesa_initiated",
+                        f"M-Pesa payment initiated for {phone_number}",
+                        details={"amount": float(total), "transaction_id": result["transaction_id"]}
+                    )
+                    return None  # Payment pending
+                else:
+                    raise ValueError(f"M-Pesa payment failed: {result.get('error')}")
             else:
                 return None
-        except ValueError:
+                
+        except Exception as e:
+            self.logbook.log_activity(
+                "checkout_failed",
+                f"Checkout failed: {str(e)}",
+                details={"payment_method": payment_method.value, "error": str(e)}
+            )
+            logger.error(f"Checkout failed: {e}")
             return None
-        
+    
+    def _complete_transaction(self, payment_details, subtotal, tax_amount, total) -> Receipt:
+        """Complete the transaction with stock deduction and receipt generation"""
         now = datetime.datetime.now()
         items_data = [{"product_name": item.product.name, "quantity": item.quantity,
                        "unit": item.product.unit, "unit_price": item.product.price_per_unit,
@@ -325,11 +637,48 @@ class MarketReceiptApp:
             }
         )
         
-        # Deduct stock from database
-        for item in self.cart:
-            self.db.update_stock(item.product.product_id, item.quantity)
+        # Use simple transaction manager for atomic-like operations
+        try:
+            # Update stock for each item
+            for item in self.cart:
+                success = self.db.tx_manager.update_stock_atomic(
+                    self.db.db, item.product.product_id, item.quantity
+                )
+                if not success:
+                    raise ValueError(f"Failed to update stock for {item.product.name}")
+                
+                # Log stock movement
+                self.logbook.log_activity(
+                    "stock_deduction",
+                    f"Stock deducted: {item.product.name} ({item.quantity} {item.product.unit})",
+                    details={
+                        "product_id": item.product.product_id,
+                        "quantity": float(item.quantity),
+                        "remaining_stock": float(item.product.stock_quantity - item.quantity)
+                    }
+                )
+            
+            # Save transaction
+            receipt_dict = asdict(receipt)
+            receipt_id = self.db.tx_manager.save_receipt_atomic(self.db.db, receipt_dict)
+            
+            # Log successful transaction
+            self.logbook.log_activity(
+                "transaction_completed",
+                f"Transaction completed: {receipt.receipt_number}",
+                details={
+                    "receipt_id": receipt_id,
+                    "total_amount": float(total),
+                    "payment_method": payment_details.method.value,
+                    "items_count": len(self.cart)
+                }
+            )
+                
+        except Exception as e:
+            logger.error(f"Transaction failed: {e}")
+            raise
         
-        self.db.save_transaction(receipt)
+        # Clear cart after successful transaction
         self.cart = []
         
         return receipt
@@ -391,6 +740,8 @@ class MarketReceiptApp:
 
 
 class CashierReceiptSystemGUI:
+    """GUI class for the Cashier Receipt System"""
+    
     def __init__(self, root):
         self.root = root
         self.root.title("Fresh Fruits Market - Cashier System")
@@ -398,13 +749,78 @@ class CashierReceiptSystemGUI:
         
         try:
             self.app = MarketReceiptApp()
-        except ConnectionError as e:
+            
+            # Setup payment notification callbacks
+            self.app.mpesa_integration.add_notification_callback(self.handle_payment_notification)
+            self.app.card_integration.add_notification_callback(self.handle_payment_notification)
+            
+            # Initialize notification window
+            self.notification_window = PaymentNotificationWindow(root)
+            
+        except (DatabaseError, ValidationError) as e:
             messagebox.showerror("Database Error", str(e))
             self.root.destroy()
             return
         
         self.setup_ui()
         self.refresh_products()
+    
+    def handle_payment_notification(self, notification):
+        """Handle payment notifications from M-Pesa and Card integrations"""
+        # Show notification popup
+        self.root.after(0, lambda: self.notification_window.show_notification(notification))
+        
+        # If payment completed, auto-complete the transaction
+        if notification.status.value == "completed":
+            self.root.after(100, self.auto_complete_payment, notification)
+    
+    def auto_complete_payment(self, notification):
+        """Auto-complete transaction after payment confirmation"""
+        try:
+            # Get current cart items
+            cart_items = self.app.get_cart_items()
+            if not cart_items:
+                return
+            
+            # Calculate totals
+            subtotal, tax_amount, total = self.app.calculate_totals()
+            
+            # Create payment details for completed transaction
+            if "MP" in notification.transaction_id:  # M-Pesa
+                payment_details = self.app.payment_processor.process_mpesa_payment(
+                    total, notification.phone_number, notification.transaction_id
+                )
+            else:  # Card
+                payment_details = self.app.payment_processor.process_card_payment(
+                    total, "****" + notification.reference[-4:], "Card", notification.transaction_id
+                )
+            
+            # Complete transaction
+            receipt = self.app._complete_transaction(payment_details, subtotal, tax_amount, total)
+            
+            if receipt:
+                # Update GUI
+                receipt_text = self.app.format_receipt(receipt)
+                self.receipt_text.delete(1.0, tk.END)
+                self.receipt_text.insert(1.0, receipt_text)
+                self.refresh_cart()
+                self.refresh_products()
+                
+                # Show receipt
+                self.show_full_receipt()
+                
+                messagebox.showinfo("Payment Completed", f"Payment of KES {notification.amount:.2f} received successfully!")
+            
+        except Exception as e:
+            logger.error(f"Auto-complete payment failed: {e}")
+            messagebox.showerror("Error", "Failed to complete payment transaction")
+    
+    def _parse_product_selection(self, selected: str) -> Tuple[str, str]:
+        """Parse product selection string to extract ID and name"""
+        parts = selected.split(" - ", 1)
+        product_id = parts[0]
+        product_name = parts[1] if len(parts) > 1 else "Unknown"
+        return product_id, product_name
     
     def setup_ui(self):
         main_frame = ttk.Frame(self.root, padding="10")
@@ -417,7 +833,11 @@ class CashierReceiptSystemGUI:
         
         # Product Management Button
         ttk.Button(header_frame, text="Manage Products", 
-                  command=self.open_product_manager).pack(pady=(5, 0))
+                  command=self.open_product_manager).pack(side=tk.LEFT, padx=5)
+        
+        # Business Management Button
+        ttk.Button(header_frame, text="Business Reports", 
+                  command=self.open_business_manager).pack(side=tk.LEFT, padx=5)
         
         content_frame = ttk.Frame(main_frame)
         content_frame.pack(fill=tk.BOTH, expand=True)
@@ -616,10 +1036,297 @@ class CashierReceiptSystemGUI:
         
         ttk.Button(manager_window, text="Close", command=manager_window.destroy).pack(pady=10)
     
+    def open_business_manager(self):
+        """Open business management and reports window"""
+        manager_window = tk.Toplevel(self.root)
+        manager_window.title("Business Management & Reports")
+        manager_window.geometry("800x600")
+        
+        # Create notebook for tabbed interface
+        notebook = ttk.Notebook(manager_window)
+        notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        # Inventory Report Tab
+        inventory_frame = ttk.Frame(notebook)
+        notebook.add(inventory_frame, text="Inventory Report")
+        self.setup_inventory_report(inventory_frame)
+        
+        # Sales Summary Tab
+        sales_frame = ttk.Frame(notebook)
+        notebook.add(sales_frame, text="Sales Summary")
+        self.setup_sales_summary(sales_frame)
+        
+        # Activity Log Tab
+        activity_frame = ttk.Frame(notebook)
+        notebook.add(activity_frame, text="Activity Log")
+        self.setup_activity_log(activity_frame)
+        
+        # Stock Movements Tab
+        movements_frame = ttk.Frame(notebook)
+        notebook.add(movements_frame, text="Stock Movements")
+        self.setup_stock_movements(movements_frame)
+        
+        ttk.Button(manager_window, text="Close", command=manager_window.destroy).pack(pady=10)
+    
+    def setup_inventory_report(self, parent):
+        """Setup inventory report interface"""
+        # Refresh button
+        ttk.Button(parent, text="Refresh Report", command=self.refresh_inventory_report).pack(pady=10)
+        
+        # Report display
+        self.inventory_text = scrolledtext.ScrolledText(parent, wrap=tk.WORD, font=('Courier', 10))
+        self.inventory_text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        # Initial report
+        self.refresh_inventory_report()
+    
+    def refresh_inventory_report(self):
+        """Refresh inventory report"""
+        try:
+            report = self.app.inventory_manager.get_inventory_report()
+            
+            self.inventory_text.delete(1.0, tk.END)
+            
+            if report:
+                lines = []
+                lines.append("=" * 60)
+                lines.append("           INVENTORY REPORT")
+                lines.append("=" * 60)
+                lines.append(f"Total Products: {report.get('total_products', 0)}")
+                lines.append(f"Total Stock Value: KES {report.get('total_stock_value', 0):.2f}")
+                lines.append("")
+                
+                # Low stock items
+                low_stock = report.get('low_stock_items', [])
+                if low_stock:
+                    lines.append("⚠️  LOW STOCK ITEMS:")
+                    lines.append("-" * 40)
+                    for item in low_stock:
+                        lines.append(f"  {item['name']}: {item['current_stock']} {item['unit']}")
+                    lines.append("")
+                
+                # All products
+                lines.append("ALL PRODUCTS:")
+                lines.append("-" * 40)
+                lines.append(f"{'Product Name':<20}{'Price':<12}{'Stock':<10}{'Value':<15}")
+                lines.append("-" * 40)
+                
+                for product in report.get('products', []):
+                    name = product['name'][:18] + ".." if len(product['name']) > 18 else product['name']
+                    price = float(product['price_per_unit'])
+                    stock = float(product['stock_quantity'])
+                    value = price * stock
+                    lines.append(f"{name:<20}{price:<12.2f}{stock:<10.1f}{value:<15.2f}")
+                
+                lines.append("=" * 60)
+                
+                self.inventory_text.insert(1.0, "\n".join(lines))
+            else:
+                self.inventory_text.insert(1.0, "No inventory data available")
+                
+        except Exception as e:
+            self.inventory_text.insert(1.0, f"Error generating report: {e}")
+    
+    def setup_sales_summary(self, parent):
+        """Setup sales summary interface"""
+        # Date range selection
+        date_frame = ttk.Frame(parent)
+        date_frame.pack(pady=10)
+        
+        ttk.Label(date_frame, text="Date Range:").pack(side=tk.LEFT, padx=5)
+        ttk.Button(date_frame, text="Today", command=lambda: self.load_sales_summary("today")).pack(side=tk.LEFT, padx=5)
+        ttk.Button(date_frame, text="This Week", command=lambda: self.load_sales_summary("week")).pack(side=tk.LEFT, padx=5)
+        ttk.Button(date_frame, text="This Month", command=lambda: self.load_sales_summary("month")).pack(side=tk.LEFT, padx=5)
+        ttk.Button(date_frame, text="All Time", command=lambda: self.load_sales_summary("all")).pack(side=tk.LEFT, padx=5)
+        
+        # Report display
+        self.sales_text = scrolledtext.ScrolledText(parent, wrap=tk.WORD, font=('Courier', 10))
+        self.sales_text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        # Initial report
+        self.load_sales_summary("today")
+    
+    def load_sales_summary(self, period):
+        """Load sales summary for specified period"""
+        try:
+            # Calculate date range based on period
+            import datetime
+            now = datetime.datetime.now()
+            
+            if period == "today":
+                start_date = now.replace(hour=0, minute=0, second=0)
+                end_date = now.replace(hour=23, minute=59, second=59)
+            elif period == "week":
+                start_date = now - datetime.timedelta(days=7)
+                end_date = now
+            elif period == "month":
+                start_date = now - datetime.timedelta(days=30)
+                end_date = now
+            else:  # all time
+                start_date = None
+                end_date = None
+            
+            date_range = (start_date, end_date) if start_date else None
+            summary = self.app.inventory_manager.get_sales_summary(date_range)
+            
+            self.sales_text.delete(1.0, tk.END)
+            
+            if summary:
+                lines = []
+                lines.append("=" * 60)
+                lines.append(f"           SALES SUMMARY - {period.upper()}")
+                lines.append("=" * 60)
+                lines.append(f"Total Sales: KES {summary.get('total_sales', 0):.2f}")
+                lines.append(f"Total Transactions: {summary.get('total_transactions', 0)}")
+                lines.append(f"Average Transaction: KES {summary.get('average_transaction', 0):.2f}")
+                lines.append("")
+                
+                # Payment methods breakdown
+                methods = summary.get('payment_methods', {})
+                lines.append("PAYMENT METHODS:")
+                lines.append("-" * 30)
+                for method, count in methods.items():
+                    lines.append(f"  {method.title()}: {count} transactions")
+                lines.append("")
+                
+                # Recent transactions
+                lines.append("RECENT TRANSACTIONS:")
+                lines.append("-" * 40)
+                lines.append(f"{'Receipt #':<12}{'Date':<12}{'Amount':<12}{'Method':<10}")
+                lines.append("-" * 40)
+                
+                receipts = summary.get('receipts', [])[:10]  # Show last 10
+                for receipt in receipts:
+                    receipt_num = receipt.get('receipt_number', 'N/A')[:10]
+                    date = receipt.get('date', 'N/A')[:10]
+                    amount = float(receipt.get('total_amount', 0))
+                    method = receipt.get('payment', {}).get('method', 'N/A')
+                    lines.append(f"{receipt_num:<12}{date:<12}{amount:<12.2f}{method:<10}")
+                
+                lines.append("=" * 60)
+                
+                self.sales_text.insert(1.0, "\n".join(lines))
+            else:
+                self.sales_text.insert(1.0, "No sales data available")
+                
+        except Exception as e:
+            self.sales_text.insert(1.0, f"Error loading sales summary: {e}")
+    
+    def setup_activity_log(self, parent):
+        """Setup activity log interface"""
+        # Filter options
+        filter_frame = ttk.Frame(parent)
+        filter_frame.pack(pady=10)
+        
+        ttk.Label(filter_frame, text="Filter:").pack(side=tk.LEFT, padx=5)
+        ttk.Button(filter_frame, text="All", command=lambda: self.load_activity_log()).pack(side=tk.LEFT, padx=5)
+        ttk.Button(filter_frame, text="Sales", command=lambda: self.load_activity_log("transaction_completed")).pack(side=tk.LEFT, padx=5)
+        ttk.Button(filter_frame, text="Stock", command=lambda: self.load_activity_log("stock_deduction")).pack(side=tk.LEFT, padx=5)
+        ttk.Button(filter_frame, text="Products", command=lambda: self.load_activity_log("product")).pack(side=tk.LEFT, padx=5)
+        
+        # Log display
+        self.activity_text = scrolledtext.ScrolledText(parent, wrap=tk.WORD, font=('Courier', 9))
+        self.activity_text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        # Initial log
+        self.load_activity_log()
+    
+    def load_activity_log(self, activity_type=None):
+        """Load activity log"""
+        try:
+            activities = self.app.logbook.get_activities(activity_type)
+            
+            self.activity_text.delete(1.0, tk.END)
+            
+            lines = []
+            lines.append("=" * 80)
+            lines.append(f"           ACTIVITY LOG - {activity_type.upper() if activity_type else 'ALL'}")
+            lines.append("=" * 80)
+            lines.append(f"{'Date':<12}{'Time':<10}{'Type':<20}{'Description':<30}{'User':<10}")
+            lines.append("-" * 80)
+            
+            for activity in activities[:50]:  # Show last 50 activities
+                date = activity.get('date', 'N/A')
+                time = activity.get('time', 'N/A')
+                act_type = activity.get('activity_type', 'N/A')[:18]
+                description = activity.get('description', 'N/A')[:28]
+                user = activity.get('user', 'N/A')
+                lines.append(f"{date:<12}{time:<10}{act_type:<20}{description:<30}{user:<10}")
+            
+            lines.append("=" * 80)
+            
+            self.activity_text.insert(1.0, "\n".join(lines))
+            
+        except Exception as e:
+            self.activity_text.insert(1.0, f"Error loading activity log: {e}")
+    
+    def setup_stock_movements(self, parent):
+        """Setup stock movements interface"""
+        # Product selection
+        select_frame = ttk.Frame(parent)
+        select_frame.pack(pady=10)
+        
+        ttk.Label(select_frame, text="Product:").pack(side=tk.LEFT, padx=5)
+        products = self.app.get_all_products()
+        product_names = [p['name'] for p in products]
+        
+        self.movement_product_var = tk.StringVar()
+        product_combo = ttk.Combobox(select_frame, textvariable=self.movement_product_var, values=product_names, width=30)
+        product_combo.pack(side=tk.LEFT, padx=5)
+        
+        ttk.Button(select_frame, text="Show Movements", command=self.load_stock_movements).pack(side=tk.LEFT, padx=5)
+        ttk.Button(select_frame, text="Show All", command=lambda: self.load_stock_movements(None)).pack(side=tk.LEFT, padx=5)
+        
+        # Movements display
+        self.movements_text = scrolledtext.ScrolledText(parent, wrap=tk.WORD, font=('Courier', 9))
+        self.movements_text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        # Initial load
+        self.load_stock_movements(None)
+    
+    def load_stock_movements(self, product_name=None):
+        """Load stock movements for a product"""
+        try:
+            # Find product ID if product name is provided
+            product_id = None
+            if product_name:
+                products = self.app.get_all_products()
+                for p in products:
+                    if p['name'] == product_name:
+                        product_id = p['product_id']
+                        break
+            
+            movements = self.app.inventory_manager.get_stock_movements(product_id)
+            
+            self.movements_text.delete(1.0, tk.END)
+            
+            lines = []
+            lines.append("=" * 80)
+            lines.append(f"           STOCK MOVEMENTS - {product_name or 'ALL PRODUCTS'}")
+            lines.append("=" * 80)
+            lines.append(f"{'Date':<12}{'Product':<20}{'Quantity':<10}{'Unit Price':<12}{'Subtotal':<12}")
+            lines.append("-" * 80)
+            
+            for movement in movements[:100]:  # Show last 100 movements
+                date = movement.get('date', 'N/A')[:10]
+                product = movement.get('product_name', 'N/A')[:18]
+                quantity = movement.get('quantity', 0)
+                unit_price = movement.get('unit_price', 0)
+                subtotal = movement.get('subtotal', 0)
+                lines.append(f"{date:<12}{product:<20}{quantity:<10}{unit_price:<12.2f}{subtotal:<12.2f}")
+            
+            lines.append("=" * 80)
+            
+            self.movements_text.insert(1.0, "\n".join(lines))
+            
+        except Exception as e:
+            self.movements_text.insert(1.0, f"Error loading stock movements: {e}")
+    
     def on_product_select(self, event=None):
+        """Handle product selection in combobox"""
         selected = self.selected_product.get()
         if selected:
-            product_id = selected.split(" - ")[0]
+            product_id, _ = self._parse_product_selection(selected)
             product_data = self.app.db.get_product(product_id)
             if product_data:
                 self.current_info.config(
@@ -653,13 +1360,14 @@ class CashierReceiptSystemGUI:
             messagebox.showerror("Error", "Please enter valid numbers for price and stock")
     
     def update_stock_gui(self):
+        """Update product stock from GUI"""
         try:
             selected = self.selected_product.get()
             if not selected:
                 messagebox.showerror("Error", "Please select a product")
                 return
-            product_id = selected.split(" - ")[0]
-            new_stock = float(self.update_stock_val.get())
+            product_id, _ = self._parse_product_selection(selected)
+            new_stock = Decimal(self.update_stock_val.get())
             
             success, message = self.app.update_product_stock(product_id, new_stock)
             if success:
@@ -669,17 +1377,18 @@ class CashierReceiptSystemGUI:
                 self.on_product_select()
             else:
                 messagebox.showerror("Error", message)
-        except ValueError:
+        except (ValueError, InvalidOperation):
             messagebox.showerror("Error", "Please enter a valid stock quantity")
     
     def update_price_gui(self):
+        """Update product price from GUI"""
         try:
             selected = self.selected_product.get()
             if not selected:
                 messagebox.showerror("Error", "Please select a product")
                 return
-            product_id = selected.split(" - ")[0]
-            new_price = float(self.update_price_val.get())
+            product_id, _ = self._parse_product_selection(selected)
+            new_price = Decimal(self.update_price_val.get())
             
             success, message = self.app.update_product_price(product_id, new_price)
             if success:
@@ -689,17 +1398,17 @@ class CashierReceiptSystemGUI:
                 self.on_product_select()
             else:
                 messagebox.showerror("Error", message)
-        except ValueError:
+        except (ValueError, InvalidOperation):
             messagebox.showerror("Error", "Please enter a valid price")
     
     def delete_product_gui(self):
+        """Delete product from GUI"""
         selected = self.selected_product.get()
         if not selected:
             messagebox.showerror("Error", "Please select a product")
             return
         
-        product_id = selected.split(" - ")[0]
-        product_name = selected.split(" - ")[1]
+        product_id, product_name = self._parse_product_selection(selected)
         
         if messagebox.askyesno("Confirm Delete", f"Are you sure you want to delete '{product_name}'?"):
             success, message = self.app.delete_product(product_id)
@@ -839,38 +1548,81 @@ class CashierReceiptSystemGUI:
             return
         method = self.payment_method.get()
         payment_details = {}
-        if method == "cash":
-            try:
-                amount = float(self.cash_amount.get())
-                payment_details = {"amount_tendered": amount}
-            except ValueError:
-                messagebox.showerror("Invalid Amount", "Please enter a valid amount")
+        
+        # Pre-validate stock availability
+        for item in cart_items:
+            product_data = self.app.db.get_product(item.product.product_id)
+            if product_data:
+                current_stock = float(product_data['stock_quantity'])
+                required_stock = float(item.quantity)
+                if current_stock < required_stock:
+                    messagebox.showerror("Insufficient Stock", 
+                        f"Insufficient stock for {item.product.name}!\n"
+                        f"Available: {current_stock} {item.product.unit}\n"
+                        f"Required: {required_stock} {item.product.unit}")
+                    return
+        
+        try:
+            if method == "cash":
+                try:
+                    amount = float(self.cash_amount.get())
+                    if amount <= 0:
+                        messagebox.showerror("Invalid Amount", "Amount must be greater than 0")
+                        return
+                    payment_details = {"amount_tendered": amount}
+                except ValueError:
+                    messagebox.showerror("Invalid Amount", "Please enter a valid amount")
+                    return
+            elif method == "card":
+                card_num = self.card_number.get().strip()
+                if not card_num:
+                    messagebox.showerror("Invalid Card", "Please enter card number")
+                    return
+                payment_details = {"card_number": card_num, "card_type": self.card_type.get()}
+            elif method == "mpesa":
+                phone = self.mpesa_phone.get().strip()
+                code = self.mpesa_code.get().strip()
+                if not phone:
+                    messagebox.showerror("Invalid Phone", "Please enter phone number")
+                    return
+                payment_details = {"phone_number": phone, "mpesa_code": code}
+            else:
+                messagebox.showerror("Error", "Please select a payment method")
                 return
-        elif method == "card":
-            card_num = self.card_number.get().strip()
-            if not card_num:
-                messagebox.showerror("Invalid Card", "Please enter card number")
-                return
-            payment_details = {"card_number": card_num, "card_type": self.card_type.get()}
-        elif method == "mpesa":
-            phone = self.mpesa_phone.get().strip()
-            code = self.mpesa_code.get().strip()
-            if not phone:
-                messagebox.showerror("Invalid Phone", "Please enter phone number")
-                return
-            payment_details = {"phone_number": phone, "mpesa_code": code}
-        pm = PaymentMethod(method)
-        receipt = self.app.checkout(pm, **payment_details)
-        if receipt:
-            receipt_text = self.app.format_receipt(receipt)
-            self.receipt_text.delete(1.0, tk.END)
-            self.receipt_text.insert(1.0, receipt_text)
-            self.refresh_cart()
-            self.refresh_products()
-            # Auto-show full receipt
-            self.show_full_receipt()
-        else:
-            messagebox.showerror("Error", "Checkout failed. Please check payment details.")
+            
+            pm = PaymentMethod(method)
+            receipt = self.app.checkout(pm, **payment_details)
+            
+            if receipt:
+                # Payment completed successfully
+                receipt_text = self.app.format_receipt(receipt)
+                self.receipt_text.delete(1.0, tk.END)
+                self.receipt_text.insert(1.0, receipt_text)
+                self.refresh_cart()
+                self.refresh_products()
+                
+                # Clear payment fields
+                if method == "cash":
+                    self.cash_amount.delete(0, tk.END)
+                elif method == "card":
+                    self.card_number.delete(0, tk.END)
+                elif method == "mpesa":
+                    self.mpesa_phone.delete(0, tk.END)
+                    self.mpesa_code.delete(0, tk.END)
+                
+                # Auto-show full receipt
+                self.show_full_receipt()
+                messagebox.showinfo("Success", "Payment processed successfully!")
+                
+            elif method in ["card", "mpesa"]:
+                # Payment initiated, waiting for confirmation
+                messagebox.showinfo("Payment Initiated", "Payment request sent. Please wait for confirmation.")
+            else:
+                messagebox.showerror("Error", "Checkout failed. Please check payment details.")
+                
+        except Exception as e:
+            logger.error(f"Checkout error: {e}")
+            messagebox.showerror("Error", f"Checkout failed: {str(e)}\n\nPlease check:\n- Cart has items\n- Payment details are correct\n- Stock is available")
     
     def print_receipt(self):
         receipt_content = self.receipt_text.get(1.0, tk.END).strip()

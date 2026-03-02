@@ -95,8 +95,8 @@ VAT (16%):                             86.40
 TOTAL:                                 626.40
 ------------------------------------------------------------
 Payment: CASH
-Amount Paid: 2000.00
-BALANCE: 1373.60
+Amount Paid: 1000.00
+BALANCE: 373.60
 ============================================================
      Thank you for shopping with us!
         Please come again!

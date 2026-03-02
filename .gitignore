@@ -1,1 +1,45 @@
-/__pycache__
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# PyInstaller
+*.manifest
+*.spec
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Application specific
+*.log
+test_*.py
+*_test.py
+
+# Build artifacts
+*.exe
+*.app
+*.dmg
+*.deb
+*.rpm
+
+# Desktop files
+*.desktop
+
+# Environment files
+.env
+.env.local
+.env.production
