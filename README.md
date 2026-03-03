@@ -7,8 +7,14 @@ A unified Python-based receipt system for fruit vendors with MongoDB database an
 | File                        | Description                                                     |
 | --------------------------- | --------------------------------------------------------------- |
 | `marketreceipt.py`          | **Main Application** - Unified GUI for cashier to process sales |
-| `FreshFruitsMarket.desktop` | Desktop icon - double-click to open GUI                         |
+| `payment_integration.py`    | Payment processing module for card and M-Pesa integrations     |
+| `simple_transaction_manager.py` | Transaction management and database operations              |
+| `type_safety.py`            | Type safety utilities and validation helpers                    |
 | `requirements.txt`          | Python dependencies                                             |
+| `Dockerfile`                | Docker container configuration                                  |
+| `docker-compose.yml`        | Docker Compose configuration for MongoDB and application        |
+| `DEPLOY.md`                 | Deployment instructions and guidelines                          |
+| `SOLUTIONS_SUMMARY.md`      | Summary of implemented solutions and features                   |
 
 ## Requirements
 

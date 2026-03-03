@@ -6,7 +6,7 @@ Handles real-time payment processing with M-Pesa and Card integrations
 
 import threading
 import time
-import requests
+import datetime
 import logging
 from typing import Dict, Optional, Callable
 from dataclasses import dataclass
@@ -287,9 +287,13 @@ class InventoryManager:
             
             movements = []
             for receipt in receipts:
+                created_at = receipt.get("created_at")
+                # Convert datetime to string for display
+                date_str = created_at.strftime("%Y-%m-%d") if isinstance(created_at, datetime.datetime) else str(created_at)
+                
                 for item in receipt.get("items", []):
                     movements.append({
-                        "date": receipt.get("created_at"),
+                        "date": date_str,
                         "product_name": item.get("product_name"),
                         "quantity": item.get("quantity"),
                         "unit_price": item.get("unit_price"),

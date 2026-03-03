@@ -7,7 +7,7 @@ Provides atomic-like operations without requiring replica sets
 import logging
 from decimal import Decimal
 from contextlib import contextmanager
-from pymongo import MongoClient, ReturnDocument
+from pymongo import MongoClient
 from pymongo.errors import PyMongoError
 
 logger = logging.getLogger(__name__)
@@ -37,31 +37,32 @@ class SimpleTransactionManager:
         try:
             products = db["products"]
             
-            # Get current product and lock with findAndModify
-            product = products.find_one_and_update(
-                {"product_id": product_id},
-                {"$inc": {"stock_quantity": -float(quantity_sold)}},
-                return_document=ReturnDocument.BEFORE
-            )
-            
+            # First, get the current product to check the stock type
+            product = products.find_one({"product_id": product_id})
             if not product:
                 raise ValueError(f"Product {product_id} not found")
             
+            # Convert stock_quantity to number if it's a string
             current_stock = Decimal(str(product["stock_quantity"]))
+            new_stock = current_stock - quantity_sold
             
-            if current_stock < quantity_sold:
-                # Rollback the increment
-                products.update_one(
-                    {"product_id": product_id},
-                    {"$inc": {"stock_quantity": float(quantity_sold)}}
-                )
+            if new_stock < 0:
                 raise ValueError(f"Insufficient stock. Available: {current_stock}, Required: {quantity_sold}")
             
-            logger.info(f"Stock updated {product_id}: {current_stock} -> {current_stock - quantity_sold}")
+            # Update with the new stock value as a number
+            result = products.update_one(
+                {"product_id": product_id},
+                {"$set": {"stock_quantity": float(new_stock)}}
+            )
+            
+            if result.modified_count == 0:
+                raise ValueError(f"Failed to update stock for {product_id}")
+            
+            logger.info(f"Stock updated for {product_id}: {current_stock} -> {new_stock}")
             return True
             
         except Exception as e:
-            logger.error(f"Failed to update stock for product {product_id}: {e}")
+            logger.error(f"Failed to update stock for {product_id}: {e}")
             return False
     
     def save_receipt_atomic(self, db, receipt_dict: dict) -> str:
@@ -87,34 +88,3 @@ class SimpleTransactionManager:
         except Exception as e:
             logger.error(f"Failed to save receipt: {e}")
             raise
-
-
-class SimpleSafeCheckoutProcessor:
-    """Simple checkout processor for standalone MongoDB"""
-    
-    def __init__(self, tx_manager: SimpleTransactionManager):
-        self.tx_manager = tx_manager
-    
-    def process_checkout(self, db, cart_items: list, receipt_dict: dict) -> bool:
-        """Process checkout with atomic-like behavior"""
-        try:
-            with self.tx_manager.transaction():
-                # Update stock for all items
-                for item in cart_items:
-                    success = self.tx_manager.update_stock_atomic(
-                        db, item.product.product_id, item.quantity
-                    )
-                    if not success:
-                        raise ValueError(f"Failed to update stock for {item.product.name}")
-                
-                # Save receipt
-                receipt_id = self.tx_manager.save_receipt_atomic(db, receipt_dict)
-                if not receipt_id:
-                    raise ValueError("Failed to save receipt")
-                
-                logger.info("Checkout completed successfully")
-                return True
-                
-        except Exception as e:
-            logger.error(f"Checkout failed: {e}")
-            return False

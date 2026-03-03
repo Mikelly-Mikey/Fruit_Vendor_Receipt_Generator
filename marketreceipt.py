@@ -22,7 +22,6 @@ from tkinter import ttk, messagebox, scrolledtext
 import datetime
 import uuid
 import os
-import re
 import logging
 from typing import List, Dict, Optional, Tuple, Any
 from dataclasses import dataclass, asdict
@@ -33,7 +32,7 @@ from contextlib import contextmanager
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
 from type_safety import TypeConverter, ValidatedProduct, ValidatedCartItem, ValidatedPaymentDetails, InputValidator
-from simple_transaction_manager import SimpleTransactionManager, SimpleSafeCheckoutProcessor
+from simple_transaction_manager import SimpleTransactionManager
 from payment_integration import MPesaIntegration, CardPaymentIntegration, PaymentNotificationWindow, InventoryManager, BusinessLogbook
 
 
@@ -42,8 +41,6 @@ VAT_RATE = Decimal('0.16')
 VAT_INCLUSIVE = True
 MONGO_TIMEOUT_MS = 5000
 DEFAULT_DB_NAME = "fruit_vendor_db"
-CARD_NUMBER_PATTERN = r'^\d{13,19}$'
-PHONE_NUMBER_PATTERN = r'^\+?\d{10,15}$'
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -77,11 +74,9 @@ class Product:
     def __post_init__(self):
         if not self.product_id:
             self.product_id = str(uuid.uuid4())[:8].upper()
-        # Ensure decimal types
-        if not isinstance(self.price_per_unit, Decimal):
-            self.price_per_unit = Decimal(str(self.price_per_unit))
-        if not isinstance(self.stock_quantity, Decimal):
-            self.stock_quantity = Decimal(str(self.stock_quantity))
+        # Use TypeConverter for consistent validation
+        self.price_per_unit = TypeConverter.to_positive_decimal(self.price_per_unit, "price_per_unit")
+        self.stock_quantity = TypeConverter.to_non_negative_decimal(self.stock_quantity, "stock_quantity")
 
 
 @dataclass
@@ -90,9 +85,8 @@ class CartItem:
     quantity: Decimal
 
     def __post_init__(self):
-        # Ensure decimal type
-        if not isinstance(self.quantity, Decimal):
-            self.quantity = Decimal(str(self.quantity))
+        # Use TypeConverter for consistent validation
+        self.quantity = TypeConverter.to_positive_decimal(self.quantity, "quantity")
 
     @property
     def subtotal(self) -> Decimal:
@@ -110,11 +104,9 @@ class PaymentDetails:
     balance: Decimal = Decimal('0.0')
 
     def __post_init__(self):
-        # Ensure decimal types
-        if not isinstance(self.amount_paid, Decimal):
-            self.amount_paid = Decimal(str(self.amount_paid))
-        if not isinstance(self.balance, Decimal):
-            self.balance = Decimal(str(self.balance))
+        # Use TypeConverter for consistent validation
+        self.amount_paid = TypeConverter.to_positive_decimal(self.amount_paid, "amount_paid")
+        self.balance = TypeConverter.to_decimal(self.balance, "balance")
 
 
 @dataclass
@@ -132,13 +124,10 @@ class Receipt:
     vendor_phone: str = "+254 700 123 456"
 
     def __post_init__(self):
-        # Ensure decimal types
-        if not isinstance(self.subtotal, Decimal):
-            self.subtotal = Decimal(str(self.subtotal))
-        if not isinstance(self.tax_amount, Decimal):
-            self.tax_amount = Decimal(str(self.tax_amount))
-        if not isinstance(self.total_amount, Decimal):
-            self.total_amount = Decimal(str(self.total_amount))
+        # Use TypeConverter for consistent validation
+        self.subtotal = TypeConverter.to_decimal(self.subtotal, "subtotal")
+        self.tax_amount = TypeConverter.to_decimal(self.tax_amount, "tax_amount")
+        self.total_amount = TypeConverter.to_decimal(self.total_amount, "total_amount")
 
 
 class DatabaseManager:
@@ -155,7 +144,6 @@ class DatabaseManager:
             
             # Initialize simple transaction manager
             self.tx_manager = SimpleTransactionManager(self.client)
-            self.checkout_processor = SimpleSafeCheckoutProcessor(self.tx_manager)
             
             # Create indexes for better performance
             self._create_indexes()
@@ -200,11 +188,19 @@ class DatabaseManager:
     
     def validate_card_number(self, card_number: str) -> bool:
         """Validate card number format"""
-        return bool(re.match(CARD_NUMBER_PATTERN, card_number.replace(" ", "")))
+        try:
+            InputValidator.validate_card_number(card_number)
+            return True
+        except ValueError:
+            return False
     
     def validate_phone_number(self, phone_number: str) -> bool:
         """Validate phone number format"""
-        return bool(re.match(PHONE_NUMBER_PATTERN, phone_number))
+        try:
+            InputValidator.validate_phone_number(phone_number)
+            return True
+        except ValueError:
+            return False
     
     def add_product(self, product: ValidatedProduct) -> str:
         """Add a new product to the database with type safety"""
@@ -326,17 +322,19 @@ class PaymentProcessor:
     def calculate_totals(items: List[CartItem]) -> Tuple[Decimal, Decimal, Decimal]:
         """Calculate totals with VAT-inclusive pricing"""
         try:
-            # Subtotal = sum of all item subtotals (prices include VAT)
-            subtotal = sum(item.subtotal for item in items)
+            # Calculate total first (sum of all item subtotals, prices include VAT)
+            total = sum(item.subtotal for item in items)
             
             if VAT_INCLUSIVE:
-                # VAT is already included in subtotal
-                # Calculate VAT component: subtotal - (subtotal / 1.16)
-                tax_amount = (subtotal - (subtotal / (Decimal('1') + VAT_RATE))).quantize(Decimal('0.01'))
-                total = subtotal  # Total equals subtotal (VAT inclusive)
+                # VAT is already included in total
+                # Calculate VAT component: total - (total / 1.16)
+                tax_amount = (total - (total / (Decimal('1') + VAT_RATE))).quantize(Decimal('0.01'))
+                # Subtotal is total minus tax (the base amount before VAT)
+                subtotal = (total / (Decimal('1') + VAT_RATE)).quantize(Decimal('0.01'))
             else:
                 # VAT is added on top
-                tax_amount = (subtotal * VAT_RATE).quantize(Decimal('0.01'))
+                tax_amount = (total * VAT_RATE).quantize(Decimal('0.01'))
+                subtotal = total  # In this case, total is the base amount
                 total = subtotal + tax_amount
             
             return subtotal, tax_amount, total
@@ -365,11 +363,10 @@ class PaymentProcessor:
     def process_card_payment(self, total: Decimal, card_number: str, card_type: str, auth_code: str) -> PaymentDetails:
         """Process card payment with validation"""
         try:
-            # Validate card number
-            if not re.match(CARD_NUMBER_PATTERN, card_number.replace(" ", "")):
-                raise ValidationError("Invalid card number format")
+            # Use InputValidator for consistent validation
+            validated_card = InputValidator.validate_card_number(card_number)
+            last_four = validated_card[-4:] if len(validated_card) >= 4 else "****"
             
-            last_four = card_number.replace(" ", "")[-4:] if len(card_number.replace(" ", "")) >= 4 else "****"
             return PaymentDetails(
                 method=PaymentMethod.CARD, 
                 amount_paid=total,
@@ -378,25 +375,24 @@ class PaymentProcessor:
                 card_type=card_type, 
                 balance=Decimal('0.0')
             )
-        except (InvalidOperation, TypeError) as e:
+        except ValueError as e:
             logger.error(f"Error processing card payment: {e}")
             raise ValidationError("Invalid card payment details") from e
     
     def process_mpesa_payment(self, total: Decimal, phone_number: str, mpesa_code: str) -> PaymentDetails:
         """Process M-Pesa payment with validation"""
         try:
-            # Validate phone number
-            if not re.match(PHONE_NUMBER_PATTERN, phone_number):
-                raise ValidationError("Invalid phone number format")
+            # Use InputValidator for consistent validation
+            validated_phone = InputValidator.validate_phone_number(phone_number)
             
             return PaymentDetails(
                 method=PaymentMethod.MPESA, 
                 amount_paid=total,
-                phone_number=phone_number, 
+                phone_number=validated_phone, 
                 transaction_reference=mpesa_code, 
                 balance=Decimal('0.0')
             )
-        except (InvalidOperation, TypeError) as e:
+        except ValueError as e:
             logger.error(f"Error processing M-Pesa payment: {e}")
             raise ValidationError("Invalid M-Pesa payment details") from e
 
@@ -448,39 +444,31 @@ class MarketReceiptApp:
     
     def get_all_products(self) -> List[Dict]:
         """Get all products from database"""
-        try:
-            return self.db.get_all_products()
-        except DatabaseError as e:
-            logger.error(f"Failed to get products: {e}")
-            raise
+        return self.db.get_all_products()
     
     def add_to_cart(self, product_id: str, quantity: Any) -> Tuple[bool, str]:
         """Add product to cart with stock validation"""
         try:
-            # Validate quantity
             validated_quantity = InputValidator.validate_quantity(quantity)
-            
             product_data = self.db.get_product(product_id)
+            
             if not product_data:
                 return False, "Product not found!"
             
             if product_data['stock_quantity'] < validated_quantity:
                 return False, f"Insufficient stock! Available: {product_data['stock_quantity']:.1f}"
             
-            # Create validated product
-            validated_product = ValidatedProduct(
-                name=product_data['name'], 
-                price_per_unit=product_data['price_per_unit'],
-                unit=product_data['unit'], 
-                stock_quantity=product_data['stock_quantity'],
-                product_id=product_data['product_id']
+            # Create and add cart item directly (filter out MongoDB _id)
+            product_fields = {k: v for k, v in product_data.items() if k != '_id'}
+            cart_item = ValidatedCartItem(
+                ValidatedProduct(**product_fields),
+                validated_quantity
             )
-            
-            # Create validated cart item
-            cart_item = ValidatedCartItem(validated_product, validated_quantity)
             self.cart.append(cart_item)
-            logger.info(f"Added to cart: {validated_quantity} {validated_product.unit} of {validated_product.name}")
-            return True, f"Added {validated_quantity} {validated_product.unit} of {validated_product.name}"
+            
+            result = f"Added {validated_quantity} {cart_item.product.unit} of {cart_item.product.name}"
+            logger.info(f"Added to cart: {result}")
+            return True, result
         except (DatabaseError, ValidationError, InvalidOperation, ValueError) as e:
             logger.error(f"Failed to add to cart: {e}")
             return False, "Failed to add item to cart"
@@ -500,63 +488,52 @@ class MarketReceiptApp:
         product_data = self.db.get_product(product_id)
         if not product_data:
             return False, "Product not found!"
-        if self.db.update_product_stock(product_id, new_stock):
-            return True, f"Stock updated for {product_data['name']} to {new_stock:.1f}"
-        return False, "Failed to update stock"
+        success, message = self.db.update_product_stock(product_id, new_stock)
+        return success, f"Stock updated for {product_data['name']} to {new_stock:.1f}" if success else "Failed to update stock"
     
     def update_product_price(self, product_id: str, new_price: float) -> tuple[bool, str]:
         """Update product price"""
+        if new_price <= 0:
+            return False, "Price must be greater than 0"
         product_data = self.db.get_product(product_id)
         if not product_data:
             return False, "Product not found!"
-        if new_price <= 0:
-            return False, "Price must be greater than 0"
-        if self.db.update_product_price(product_id, new_price):
-            return True, f"Price updated for {product_data['name']} to KES {new_price:.2f}"
-        return False, "Failed to update price"
+        success, message = self.db.update_product_price(product_id, new_price)
+        return success, f"Price updated for {product_data['name']} to KES {new_price:.2f}" if success else "Failed to update price"
     
     def add_new_product(self, name: str, price: Any, unit: str, stock: Any) -> tuple[bool, str]:
         """Add a new product to database with type safety"""
         try:
-            # Validate inputs
-            validated_name = InputValidator.validate_product_name(name)
-            validated_price = InputValidator.validate_price(price)
-            validated_unit = InputValidator.validate_unit(unit)
-            validated_stock = InputValidator.validate_stock(stock)
-            
-            # Create validated product
             product = ValidatedProduct(
-                name=validated_name,
-                price_per_unit=validated_price,
-                unit=validated_unit,
-                stock_quantity=validated_stock
+                name=InputValidator.validate_product_name(name),
+                price_per_unit=InputValidator.validate_price(price),
+                unit=InputValidator.validate_unit(unit),
+                stock_quantity=InputValidator.validate_stock(stock)
             )
-            
             self.db.add_product(product)
-            return True, f"Product '{validated_name}' added with ID: {product.product_id}"
-        except ValueError as e:
-            return False, str(e)
-        except Exception as e:
-            logger.error(f"Failed to add product: {e}")
-            return False, "Failed to add product"
+            return True, f"Product '{product.name}' added with ID: {product.product_id}"
+        except (ValueError, Exception) as e:
+            return False, str(e) if isinstance(e, ValueError) else "Failed to add product"
     
     def delete_product(self, product_id: str) -> tuple[bool, str]:
         """Remove product from database"""
         product_data = self.db.get_product(product_id)
         if not product_data:
             return False, "Product not found!"
-        if self.db.delete_product(product_id):
-            return True, f"Product '{product_data['name']}' deleted"
-        return False, "Failed to delete product"
+        success = self.db.delete_product(product_id)
+        return success, f"Product '{product_data['name']}' deleted" if success else "Failed to delete product"
     
     def calculate_totals(self) -> tuple:
         return self.payment_processor.calculate_totals(self.cart)
     
     def checkout(self, payment_method: PaymentMethod, **kwargs) -> Optional[Receipt]:
+        logger.info(f"Starting checkout with payment method: {payment_method}")
         if not self.cart:
+            logger.warning("Cart is empty")
             return None
         
         subtotal, tax_amount, total = self.payment_processor.calculate_totals(self.cart)
+        logger.info(f"Calculated totals - subtotal: {subtotal}, tax: {tax_amount}, total: {total}")
         
         try:
             # Log checkout attempt
@@ -568,19 +545,33 @@ class MarketReceiptApp:
             
             if payment_method == PaymentMethod.CASH:
                 amount_tendered = kwargs.get('amount_tendered', 0)
+                logger.info(f"Processing cash payment - amount_tendered: {amount_tendered}, total: {total}")
                 payment_details = self.payment_processor.process_cash_payment(total, amount_tendered)
+                logger.info(f"Cash payment processed: {payment_details}")
                 
                 # Cash payment is immediate - proceed with transaction
-                return self._complete_transaction(payment_details, subtotal, tax_amount, total)
+                receipt = self._complete_transaction(payment_details, subtotal, tax_amount, total)
+                logger.info(f"Transaction completed, receipt: {receipt}")
+                return receipt
                 
             elif payment_method == PaymentMethod.CARD:
                 card_number = kwargs.get('card_number', '')
                 card_type = kwargs.get('card_type', 'Card')
                 auth_code = kwargs.get('auth_code', str(uuid.uuid4())[:6].upper())
                 
-                # For card payments, also process immediately for now
-                payment_details = self.payment_processor.process_card_payment(total, card_number, card_type, auth_code)
-                return self._complete_transaction(payment_details, subtotal, tax_amount, total)
+                # Process card payment asynchronously
+                result = self.card_integration.process_card_payment(card_number, float(total), card_type)
+                if result["success"]:
+                    # For card payments, we need to wait for processing confirmation
+                    # Return None to indicate payment is pending
+                    self.logbook.log_activity(
+                        "card_initiated",
+                        f"Card payment initiated for {card_type}",
+                        details={"amount": float(total), "transaction_id": result["transaction_id"]}
+                    )
+                    return None  # Payment pending
+                else:
+                    raise ValueError(f"Card payment failed: {result.get('error')}")
                     
             elif payment_method == PaymentMethod.MPESA:
                 phone_number = kwargs.get('phone_number', '')
@@ -684,57 +675,72 @@ class MarketReceiptApp:
         return receipt
     
     def format_receipt(self, receipt: Receipt) -> str:
-        lines = []
-        lines.append("=" * 60)
-        lines.append("           FRESH FRUITS MARKET")
-        lines.append("        " + receipt.vendor_address)
-        lines.append("          Tel: " + receipt.vendor_phone)
-        lines.append("=" * 60)
-        lines.append(f"Receipt No: {receipt.receipt_number}")
-        lines.append(f"Date: {receipt.date}          Time: {receipt.time}")
-        lines.append("-" * 60)
-        lines.append(f"{'Item':<18}{'Qty':<10}{'Price':<12}{'Total':<12}")
-        lines.append("-" * 60)
+        """Format receipt for display"""
+        lines = [
+            "=" * 60,
+            "           FRESH FRUITS MARKET",
+            f"        {receipt.vendor_address}",
+            f"          Tel: {receipt.vendor_phone}",
+            "=" * 60,
+            f"Receipt No: {receipt.receipt_number}",
+            f"Date: {receipt.date}          Time: {receipt.time}",
+            "-" * 60,
+            f"{'Item':<18}{'Qty':<10}{'Price':<12}{'Total':<12}",
+            "-" * 60
+        ]
         
+        # Add items
         for item in receipt.items:
             qty_str = f"{item['quantity']:.1f} {item['unit']}"
             lines.append(f"{item['product_name']:<18}{qty_str:<10}{item['unit_price']:<12.2f}{item['subtotal']:<12.2f}")
         
         lines.append("-" * 60)
         
-        # VAT-inclusive display
-        if abs(receipt.subtotal - receipt.total_amount) < 0.01:  # VAT inclusive
-            lines.append(f"{'Subtotal (incl. VAT):':<40}{receipt.subtotal:>18.2f}")
-            lines.append(f"{'VAT Included (16%):':<40}{receipt.tax_amount:>18.2f}")
-            lines.append(f"{'TOTAL:':<40}{receipt.total_amount:>18.2f}")
-        else:  # VAT exclusive
-            lines.append(f"{'Subtotal:':<40}{receipt.subtotal:>18.2f}")
-            lines.append(f"{'VAT (16%):':<40}{receipt.tax_amount:>18.2f}")
-            lines.append(f"{'TOTAL:':<40}{receipt.total_amount:>18.2f}")
+        # Add totals (VAT handling)
+        vat_inclusive = abs(receipt.subtotal - receipt.total_amount) < 0.01
+        if vat_inclusive:
+            lines.extend([
+                f"{'Subtotal (incl. VAT):':<40}{receipt.subtotal:>18.2f}",
+                f"{'VAT Included (16%):':<40}{receipt.tax_amount:>18.2f}",
+                f"{'TOTAL:':<40}{receipt.total_amount:>18.2f}"
+            ])
+        else:
+            lines.extend([
+                f"{'Subtotal:':<40}{receipt.subtotal:>18.2f}",
+                f"{'VAT (16%):':<40}{receipt.tax_amount:>18.2f}",
+                f"{'TOTAL:':<40}{receipt.total_amount:>18.2f}"
+            ])
         
         lines.append("-" * 60)
         
+        # Add payment details
         payment = receipt.payment
-        lines.append(f"Payment: {payment['method'].upper()}")
-        lines.append(f"Amount Paid: {payment['amount_paid']:>.2f}")
+        lines.extend([
+            f"Payment: {payment['method'].upper()}",
+            f"Amount Paid: {payment['amount_paid']:>.2f}"
+        ])
         
         if payment['balance'] > 0:
             lines.append(f"BALANCE: {payment['balance']:.2f}")
         
-        if payment.get('transaction_reference'):
-            lines.append(f"Ref: {payment['transaction_reference']}")
+        # Add optional payment details
+        optional_fields = [
+            ('transaction_reference', 'Ref: {}'),
+            ('phone_number', 'M-Pesa: {}'),
+            ('card_last_four', f"{payment.get('card_type', 'Card')}: ****{{}}")
+        ]
         
-        if payment.get('phone_number'):
-            lines.append(f"M-Pesa: {payment['phone_number']}")
+        for field, template in optional_fields:
+            if payment.get(field):
+                lines.append(template.format(payment[field]))
         
-        if payment.get('card_last_four'):
-            card_type = payment.get('card_type', 'Card')
-            lines.append(f"{card_type}: ****{payment['card_last_four']}")
-        
-        lines.append("=" * 60)
-        lines.append("     Thank you for shopping with us!")
-        lines.append("        Please come again!")
-        lines.append("=" * 60)
+        # Footer
+        lines.extend([
+            "=" * 60,
+            "     Thank you for shopping with us!",
+            "        Please come again!",
+            "=" * 60
+        ])
         
         return "\n".join(lines)
 
@@ -1308,7 +1314,7 @@ class CashierReceiptSystemGUI:
             lines.append("-" * 80)
             
             for movement in movements[:100]:  # Show last 100 movements
-                date = movement.get('date', 'N/A')[:10]
+                date = movement.get('date', 'N/A')
                 product = movement.get('product_name', 'N/A')[:18]
                 quantity = movement.get('quantity', 0)
                 unit_price = movement.get('unit_price', 0)
@@ -1570,6 +1576,11 @@ class CashierReceiptSystemGUI:
                         messagebox.showerror("Invalid Amount", "Amount must be greater than 0")
                         return
                     payment_details = {"amount_tendered": amount}
+                    logger.info(f"Processing cash payment: amount={amount}")
+                except ValueError as e:
+                    logger.error(f"Invalid cash amount: {e}")
+                    messagebox.showerror("Invalid Amount", "Please enter a valid cash amount")
+                    return
                 except ValueError:
                     messagebox.showerror("Invalid Amount", "Please enter a valid amount")
                     return
@@ -1591,10 +1602,12 @@ class CashierReceiptSystemGUI:
                 return
             
             pm = PaymentMethod(method)
+            logger.info(f"Initiating checkout with method: {method}, details: {payment_details}")
             receipt = self.app.checkout(pm, **payment_details)
+            logger.info(f"Checkout result: {receipt}")
             
             if receipt:
-                # Payment completed successfully
+                # Payment completed successfully (cash or completed async payment)
                 receipt_text = self.app.format_receipt(receipt)
                 self.receipt_text.delete(1.0, tk.END)
                 self.receipt_text.insert(1.0, receipt_text)
@@ -1614,15 +1627,25 @@ class CashierReceiptSystemGUI:
                 self.show_full_receipt()
                 messagebox.showinfo("Success", "Payment processed successfully!")
                 
-            elif method in ["card", "mpesa"]:
-                # Payment initiated, waiting for confirmation
-                messagebox.showinfo("Payment Initiated", "Payment request sent. Please wait for confirmation.")
+            elif receipt is None and method in ["card", "mpesa"]:
+                # Payment initiated successfully, waiting for confirmation (async payments)
+                messagebox.showinfo("Payment Initiated", 
+                    f"{method.capitalize()} payment request sent.\n\n" +
+                    f"Please check your phone for M-Pesa or wait for card processing.\n" +
+                    f"The receipt will be generated automatically once payment is confirmed.")
             else:
-                messagebox.showerror("Error", "Checkout failed. Please check payment details.")
+                # Checkout failed for other reasons
+                messagebox.showerror("Error", "Checkout failed. Please check payment details and try again.")
                 
+        except ValidationError as e:
+            logger.error(f"Validation error during checkout: {e}")
+            messagebox.showerror("Validation Error", f"Invalid input: {str(e)}")
+        except DatabaseError as e:
+            logger.error(f"Database error during checkout: {e}")
+            messagebox.showerror("Database Error", "Failed to process transaction. Please try again.")
         except Exception as e:
-            logger.error(f"Checkout error: {e}")
-            messagebox.showerror("Error", f"Checkout failed: {str(e)}\n\nPlease check:\n- Cart has items\n- Payment details are correct\n- Stock is available")
+            logger.error(f"Unexpected error during checkout: {e}")
+            messagebox.showerror("Error", f"An unexpected error occurred: {str(e)}\n\nPlease check:\n- Cart has items\n- Payment details are correct\n- Stock is available")
     
     def print_receipt(self):
         receipt_content = self.receipt_text.get(1.0, tk.END).strip()
