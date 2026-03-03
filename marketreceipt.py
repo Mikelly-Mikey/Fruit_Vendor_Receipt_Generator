@@ -64,52 +64,6 @@ class DatabaseError(Exception):
 
 
 @dataclass
-class Product:
-    name: str
-    price_per_unit: Decimal
-    unit: str
-    stock_quantity: Decimal
-    product_id: Optional[str] = None
-
-    def __post_init__(self):
-        if not self.product_id:
-            self.product_id = str(uuid.uuid4())[:8].upper()
-        # Use TypeConverter for consistent validation
-        self.price_per_unit = TypeConverter.to_positive_decimal(self.price_per_unit, "price_per_unit")
-        self.stock_quantity = TypeConverter.to_non_negative_decimal(self.stock_quantity, "stock_quantity")
-
-
-@dataclass
-class CartItem:
-    product: Product
-    quantity: Decimal
-
-    def __post_init__(self):
-        # Use TypeConverter for consistent validation
-        self.quantity = TypeConverter.to_positive_decimal(self.quantity, "quantity")
-
-    @property
-    def subtotal(self) -> Decimal:
-        return self.product.price_per_unit * self.quantity
-
-
-@dataclass
-class PaymentDetails:
-    method: PaymentMethod
-    amount_paid: Decimal
-    transaction_reference: Optional[str] = None
-    phone_number: Optional[str] = None
-    card_last_four: Optional[str] = None
-    card_type: Optional[str] = None
-    balance: Decimal = Decimal('0.0')
-
-    def __post_init__(self):
-        # Use TypeConverter for consistent validation
-        self.amount_paid = TypeConverter.to_positive_decimal(self.amount_paid, "amount_paid")
-        self.balance = TypeConverter.to_decimal(self.balance, "balance")
-
-
-@dataclass
 class Receipt:
     receipt_number: str
     date: str
@@ -319,7 +273,7 @@ class PaymentProcessor:
     """Handles payment processing and calculations"""
     
     @staticmethod
-    def calculate_totals(items: List[CartItem]) -> Tuple[Decimal, Decimal, Decimal]:
+    def calculate_totals(items: List[ValidatedCartItem]) -> Tuple[Decimal, Decimal, Decimal]:
         """Calculate totals with VAT-inclusive pricing"""
         try:
             # Calculate total first (sum of all item subtotals, prices include VAT)
@@ -342,7 +296,7 @@ class PaymentProcessor:
             logger.error(f"Error calculating totals: {e}")
             raise ValidationError("Invalid calculation parameters") from e
     
-    def process_cash_payment(self, total: Decimal, amount_tendered: Any) -> PaymentDetails:
+    def process_cash_payment(self, total: Decimal, amount_tendered: Any) -> ValidatedPaymentDetails:
         """Process cash payment with validation"""
         try:
             # Convert amount_tendered to Decimal
@@ -351,8 +305,8 @@ class PaymentProcessor:
             if validated_amount < total:
                 raise ValidationError("Insufficient amount tendered")
             balance = validated_amount - total
-            return PaymentDetails(
-                method=PaymentMethod.CASH, 
+            return ValidatedPaymentDetails(
+                method=PaymentMethod.CASH.value, 
                 amount_paid=validated_amount, 
                 balance=balance
             )
@@ -360,15 +314,15 @@ class PaymentProcessor:
             logger.error(f"Error processing cash payment: {e}")
             raise ValidationError("Invalid payment amount") from e
     
-    def process_card_payment(self, total: Decimal, card_number: str, card_type: str, auth_code: str) -> PaymentDetails:
+    def process_card_payment(self, total: Decimal, card_number: str, card_type: str, auth_code: str) -> ValidatedPaymentDetails:
         """Process card payment with validation"""
         try:
             # Use InputValidator for consistent validation
             validated_card = InputValidator.validate_card_number(card_number)
             last_four = validated_card[-4:] if len(validated_card) >= 4 else "****"
             
-            return PaymentDetails(
-                method=PaymentMethod.CARD, 
+            return ValidatedPaymentDetails(
+                method=PaymentMethod.CARD.value, 
                 amount_paid=total,
                 transaction_reference=auth_code, 
                 card_last_four=last_four,
@@ -379,14 +333,14 @@ class PaymentProcessor:
             logger.error(f"Error processing card payment: {e}")
             raise ValidationError("Invalid card payment details") from e
     
-    def process_mpesa_payment(self, total: Decimal, phone_number: str, mpesa_code: str) -> PaymentDetails:
+    def process_mpesa_payment(self, total: Decimal, phone_number: str, mpesa_code: str) -> ValidatedPaymentDetails:
         """Process M-Pesa payment with validation"""
         try:
             # Use InputValidator for consistent validation
             validated_phone = InputValidator.validate_phone_number(phone_number)
             
-            return PaymentDetails(
-                method=PaymentMethod.MPESA, 
+            return ValidatedPaymentDetails(
+                method=PaymentMethod.MPESA.value, 
                 amount_paid=total,
                 phone_number=validated_phone, 
                 transaction_reference=mpesa_code, 
@@ -425,15 +379,15 @@ class MarketReceiptApp:
         try:
             if not self.db.get_all_products():
                 sample_products = [
-                    Product("Apples", Decimal('50.0'), "piece", Decimal('100.0')),
-                    Product("Ripe Banana", Decimal('10.0'), "piece", Decimal('150.0')),
-                    Product("Oranges", Decimal('10.0'), "piece", Decimal('80.0')),
-                    Product("Mangoes", Decimal('50.0'), "piece", Decimal('200.0')),
-                    Product("Pineapples", Decimal('80.0'), "piece", Decimal('50.0')),
-                    Product("Watermelon", Decimal('300.0'), "piece", Decimal('30.0')),
-                    Product("Coconut", Decimal('120.0'), "piece", Decimal('30.0')),
-                    Product("Grapes", Decimal('400.0'), "punnet", Decimal('40.0')),
-                    Product("Strawberries", Decimal('500.0'), "punnet", Decimal('60.0')),
+                    ValidatedProduct("Apples", Decimal('50.0'), "piece", Decimal('100.0')),
+                    ValidatedProduct("Ripe Banana", Decimal('10.0'), "piece", Decimal('150.0')),
+                    ValidatedProduct("Oranges", Decimal('10.0'), "piece", Decimal('80.0')),
+                    ValidatedProduct("Mangoes", Decimal('50.0'), "piece", Decimal('200.0')),
+                    ValidatedProduct("Pineapples", Decimal('80.0'), "piece", Decimal('50.0')),
+                    ValidatedProduct("Watermelon", Decimal('300.0'), "piece", Decimal('30.0')),
+                    ValidatedProduct("Coconut", Decimal('120.0'), "piece", Decimal('30.0')),
+                    ValidatedProduct("Grapes", Decimal('400.0'), "punnet", Decimal('40.0')),
+                    ValidatedProduct("Strawberries", Decimal('500.0'), "punnet", Decimal('60.0')),
                 ]
                 for product in sample_products:
                     self.db.add_product(product)
@@ -618,7 +572,7 @@ class MarketReceiptApp:
             tax_amount=tax_amount,
             total_amount=total,
             payment={
-                "method": payment_details.method.value,
+                "method": payment_details.method,
                 "amount_paid": payment_details.amount_paid,
                 "balance": payment_details.balance,
                 "transaction_reference": payment_details.transaction_reference,
@@ -660,7 +614,7 @@ class MarketReceiptApp:
                 details={
                     "receipt_id": receipt_id,
                     "total_amount": float(total),
-                    "payment_method": payment_details.method.value,
+                    "payment_method": payment_details.method,
                     "items_count": len(self.cart)
                 }
             )
